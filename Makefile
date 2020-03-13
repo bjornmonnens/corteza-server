@@ -1,12 +1,32 @@
-.PHONY: help docker docker-push realize qa critic vet codegen integration
+.PHONY: pack build help realize qa critic vet codegen integration
 
-GO        = go
-GOGET     = $(GO) get -u
+GO         = go
+GOGET      = $(GO) get -u
 GOTEST    ?= go test
+GOFLAGS   ?= -mod=vendor
 
-BASEPKGS = system compose messaging
-IMAGES   = corteza-server-system corteza-server-compose corteza-server-messaging corteza-server
-TESTABLE = messaging system compose pkg internal
+export GOFLAGS
+
+BUILD_FLAVOUR         ?= corteza
+BUILD_APPS            ?= system compose messaging monolith
+BUILD_TIME            ?= $(shell date +%FT%T%z)
+BUILD_GIT_TAG         ?= $(shell git describe --tags --abbrev=0)
+BUILD_ARCH            ?= $(shell go env GOARCH)
+BUILD_OS              ?= $(shell go env GOOS)
+BUILD_OS_is_windows    = $(filter windows,$(BUILD_OS))
+BUILD_DEST_DIR        ?= build
+BUILD_NAME             = $(BUILD_FLAVOUR)-server-$*-$(BUILD_GIT_TAG)-$(BUILD_OS)-$(BUILD_ARCH)
+BUILD_BIN_NAME         = $(BUILD_NAME)$(if $(BUILD_OS_is_windows),.exe,)
+
+RELEASE_BASEDIR        = $(BUILD_DEST_DIR)/pkg/$(BUILD_FLAVOUR)-server-$*
+RELEASE_NAME           = $(BUILD_NAME).tar.gz
+RELEASE_EXTRA_FILES   ?= README.md LICENSE CONTRIBUTING.md DCO .env.example
+
+LDFLAGS_BUILD_TIME     = -X github.com/cortezaproject/corteza-server/pkg/version.BuildTime=$(BUILD_TIME)
+LDFLAGS_GIT_TAG        = -X github.com/cortezaproject/corteza-server/pkg/version.Version=$(BUILD_GIT_TAG)
+LDFLAGS_EXTRA         ?=
+LDFLAGS                = -ldflags "$(LDFLAGS_BUILD_TIME) $(LDFLAGS_GIT_TAG) $(LDFLAGS_EXTRA)"
+
 
 # Run watcher with a different event-trigger delay, eg:
 # $> WATCH_DELAY=5s make watch.test.integration
@@ -35,8 +55,12 @@ TEST_SUITE_unit        = $(TEST_SUITE_pkg) $(TEST_SUITE_services)
 TEST_SUITE_integration = ./tests/...
 TEST_SUITE_all         = $(TEST_SUITE_unit) $(TEST_SUITE_integration)
 
-DEV_MINIO_PORT ?= 9000
+# Dev Support apps settings
+DEV_MINIO_PORT        ?= 9000
+DEV_MAILHOG_SMTP_ADDR ?= 1025
+DEV_MAILHOG_HTTP_ADDR ?= 8025
 
+DOCKER                ?= docker
 
 ########################################################################################################################
 # Tool bins
@@ -55,29 +79,43 @@ help:
 	@echo
 	@echo Usage: make [target]
 	@echo
-	@echo - docker-images: builds docker images locally
-	@echo - docker-push:   push built images
+	@echo - build             build all apps
+	@echo - build.<app>       build a specific app
+	@echo - vet               run go vet on all code
+	@echo - critic            run go critic on all code
+	@echo - test.all          run all tests
+	@echo - test.unit         run all unit tests
+	@echo - test.integration  run all integration tests
 	@echo
-	@echo - vet - run go vet on all code
-	@echo - critic - run go critic on all code
-	@echo - test.all - run all tests
-	@echo - test.unit - run all unit tests
-	@echo - test.integration - run all integration tests
-	@echo
-	@echo See tests/README.md for more info
+	@echo See tests/README.md for more info on running tests
 	@echo
 
+########################################################################################################################
+# Building & packing
 
-docker-images: $(IMAGES:%=docker-image.%)
+build: $(addprefix build., $(BUILD_APPS))
 
-docker-image.%: Dockerfile.%
-	@ docker build --no-cache --rm -f Dockerfile.$* -t cortezaproject/$*:latest .
+build.%: cmd/%
+	GOOS=$(BUILD_OS) GOARCH=$(BUILD_ARCH) go build $(LDFLAGS) -o $(BUILD_DEST_DIR)/$(BUILD_BIN_NAME) cmd/$*/main.go
 
-docker-push: $(IMAGES:%=docker-push.%)
+release.%: $(addprefix build., %)
+	@ mkdir -p $(RELEASE_BASEDIR) $(RELEASE_BASEDIR)/bin
+	@ cp $(RELEASE_EXTRA_FILES) $(RELEASE_BASEDIR)/
+	@ cp $(BUILD_DEST_DIR)/$(BUILD_BIN_NAME) $(RELEASE_BASEDIR)/bin/$(BUILD_FLAVOUR)-server-$*
+	@ tar -C $(dir $(RELEASE_BASEDIR)) -czf $(BUILD_DEST_DIR)/$(RELEASE_NAME) $(notdir $(RELEASE_BASEDIR))
 
-docker-push.%: Dockerfile.%
-	@ docker push cortezaproject/$*:latest
+release: $(addprefix release.,$(BUILD_APPS))
 
+release-clean:
+	@ rm -rf $(RELEASE_BASEDIR)
+
+upload: .upload-rsa
+	@ echo "put $(BUILD_DEST_DIR)/*.tar.gz" | sftp -q -i .upload-rsa $(RELEASE_SFTP_URI)
+	@ rm -f .upload-rsa
+
+.upload-rsa:
+	@ echo $(RELEASE_SFTP_KEY) | base64 -d > $@
+	@ chmod 0400 $@
 
 ########################################################################################################################
 # Development
@@ -89,12 +127,12 @@ codegen: $(PROTOGEN)
 	./codegen.sh
 
 mailhog.up:
-	docker run --rm --publish 8025:8025 --publish 1025:1025 mailhog/mailhog
+	$(DOCKER) run --rm --publish $(DEV_MAILHOG_SMTP_ADDR):8025 --publish $(DEV_MAILHOG_HTTP_ADDR):1025 mailhog/mailhog
 
 minio.up:
 	# Runs temp minio server
-	# No volume because we do not want the data to persist
-	docker run --rm --publish 9000:$(DEV_MINIO_PORT) --env-file .env minio/minio server /data
+	# No volume mounts because we do not want the data to persist
+	$(DOCKER) run --rm --publish $(DEV_MINIO_PORT):9000 --env-file .env minio/minio server /data
 
 watch.test.%: $(NODEMON)
 	# Development helper - watches for file
